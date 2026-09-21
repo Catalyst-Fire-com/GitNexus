@@ -1195,6 +1195,29 @@ export const TYPESCRIPT_SCOPE_QUERY = `
   function: (await_expression
     (identifier) @reference.name)) @reference.call.free
 
+;; \`fn.call(thisArg, ...)\` / \`fn.apply(thisArg, args)\` invoke FN, not a method
+;; named \`call\`. Without this the generic member-call rule below captures
+;; \`call\` as @reference.name and \`fn\` as the receiver, so the real target gains
+;; no CALLS edge and impact reports zero callers for a function with many. The
+;; \`this:\` parameter pattern this serves is first-class TypeScript
+;; (ThisParameterType / OmitThisParameter), and a codebase that delegates this
+;; way can have hundreds of such sites. \`bind\` is excluded on purpose: it
+;; produces a function value rather than invoking one.
+(call_expression
+  function: (member_expression
+    object: (identifier) @reference.name
+    property: (property_identifier) @_this_invoke)
+  (#any-of? @_this_invoke "call" "apply")) @reference.call.free
+
+;; Same, through a namespace or object: \`ns.fn.call(thisArg, ...)\`.
+(call_expression
+  function: (member_expression
+    object: (member_expression
+      object: (_) @reference.receiver
+      property: (property_identifier) @reference.name)
+    property: (property_identifier) @_this_invoke2)
+  (#any-of? @_this_invoke2 "call" "apply")) @reference.call.member
+
 ;; References — member calls: \`obj.method()\` (includes optional chain).
 ;; The (_) wildcard matches any named receiver including \`this\` /
 ;; \`super\` (both are named nodes in tree-sitter-typescript, unlike C#'s
