@@ -833,6 +833,11 @@ export function findClassBindingInScope(
   const local = walkScopeChain(startScope, receiverName, scopes, (def) => isClassLike(def.type));
   if (local !== undefined) return local;
 
+  const aliased = followTypeAlias(startScope, receiverName, scopes, (target, at) =>
+    findClassBindingInScope(at, target, scopes, stripDecoration, lookup),
+  );
+  if (aliased !== undefined) return aliased;
+
   // Fallback for languages (Go) where namespace-style imports don't
   // create scope bindings: resolve via QualifiedNameIndex. Only fires
   // when the scope-chain walk found nothing; single-match wins.
@@ -1645,7 +1650,49 @@ export function findShapeBindingInScope(
   receiverName: string,
   scopes: ScopeResolutionIndexes,
 ): SymbolDefinition | undefined {
-  return walkScopeChain(startScope, receiverName, scopes, (def) => isShapeLike(def.type));
+  const shape = walkScopeChain(startScope, receiverName, scopes, (def) => isShapeLike(def.type));
+  // An alias that NAMES another type has no members of its own; its target does.
+  if (shape !== undefined && !(shape.type === 'TypeAlias' && shape.declaredType !== undefined))
+    return shape;
+  return (
+    followTypeAlias(startScope, receiverName, scopes, (target, at) =>
+      findShapeBindingInScope(at, target, scopes),
+    ) ?? shape
+  );
+}
+
+/** Aliases being followed, so `type A = B; type B = A` terminates. */
+const followingAliases = new Set<string>();
+
+/**
+ * Resolve a name through a type alias that NAMES another type (`type Plain =
+ * View`, `type Families = Pick<View, ...>` — the target is recorded as the
+ * alias's `declaredType` by the language's captures). Returns what `resolve`
+ * finds for the target, or undefined when the name is no such alias.
+ *
+ * The target is resolved in the ALIAS'S file, not the caller's: a file that
+ * imports `Families` rarely imports the class it is written over.
+ */
+function followTypeAlias(
+  startScope: ScopeId,
+  name: string,
+  scopes: ScopeResolutionIndexes,
+  resolve: (target: string, at: ScopeId) => SymbolDefinition | undefined,
+): SymbolDefinition | undefined {
+  const alias = walkScopeChain(
+    startScope,
+    name,
+    scopes,
+    (def) => def.type === 'TypeAlias' && def.declaredType !== undefined,
+  );
+  const target = alias?.declaredType;
+  if (target === undefined || target === name || followingAliases.has(name)) return undefined;
+  followingAliases.add(name);
+  try {
+    return resolve(target, scopes.moduleScopes.get(alias!.filePath) ?? startScope);
+  } finally {
+    followingAliases.delete(name);
+  }
 }
 
 /**

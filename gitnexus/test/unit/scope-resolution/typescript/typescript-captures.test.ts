@@ -792,3 +792,31 @@ export async function run(token: string) {
     });
   });
 });
+
+describe('type alias that names a class', () => {
+  const aliasTargets = (src: string) =>
+    Object.fromEntries(
+      emitTsScopeCaptures(src, 'view.ts')
+        .filter((m) => m['@declaration.type_alias'] !== undefined)
+        .map((m) => [m['@declaration.name']?.text, m['@declaration.field-type']?.text]),
+    );
+
+  it('records the named type, directly or through a member-preserving utility', () => {
+    expect(
+      aliasTargets(`class View {}
+type Plain = View;
+type Families = Pick<View, 'a'>;
+type Loose = Partial<Readonly<View>>;
+type Either = View | string;
+type Shape = { a: number };
+type Mapped = Record<string, View>;`),
+    ).toEqual({
+      Plain: 'View',
+      Families: 'View',
+      Loose: 'View',
+      Either: undefined,
+      Shape: undefined,
+      Mapped: undefined,
+    });
+  });
+});

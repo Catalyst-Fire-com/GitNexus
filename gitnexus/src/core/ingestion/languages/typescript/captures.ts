@@ -357,6 +357,28 @@ function findSelfOrAncestorOfTypes(
   return null;
 }
 
+/** Utility types that keep the members of their FIRST type argument (a subset
+ *  or a modifier of them), so a call through the alias is a call on that type. */
+const MEMBER_PRESERVING_UTILITIES = new Set(['Pick', 'Omit', 'Partial', 'Readonly', 'Required']);
+
+/** The type an alias's value names, when it names exactly one: a bare
+ *  `type_identifier`, or the first argument of a member-preserving utility.
+ *  Anything else — a union, an object type, a mapped or conditional type —
+ *  has no single owner and yields undefined. */
+function tsAliasTarget(value: SyntaxNode | null): SyntaxNode | undefined {
+  if (value === null) return undefined;
+  if (value.type === 'type_identifier') return value;
+  if (value.type !== 'generic_type') return undefined;
+  const name = value.childForFieldName('name');
+  if (name === null || !MEMBER_PRESERVING_UTILITIES.has(name.text)) return undefined;
+  const args =
+    value.childForFieldName('type_arguments') ??
+    value.namedChildren.find((c) => c.type === 'type_arguments') ??
+    null;
+  const first = args?.namedChildren[0];
+  return first !== undefined ? tsAliasTarget(first) : undefined;
+}
+
 export function emitTsScopeCaptures(
   sourceText: string,
   filePath: string,
@@ -681,6 +703,24 @@ export function emitTsScopeCaptures(
           '@declaration.is-exported',
           declNameNode,
           verdict ? 'true' : 'false',
+        );
+      }
+    }
+    // A type alias that NAMES another type — `type Plain = View`, or a utility
+    // type over one, `type Families = Pick<View, 'a' | 'b'>` — is that type for
+    // member lookup. Without this the alias is a dead end: a receiver typed as
+    // it (a parameter, or a method's return type) resolves to a TypeAlias with
+    // no members, and every call through it gains no CALLS edge. Recorded as
+    // the alias's declared type, which resolution follows (see
+    // `followTypeAlias`). Object-type aliases are untouched: they own members.
+    const aliasAnchor = groupedNodes['@declaration.type_alias'];
+    if (aliasAnchor !== undefined && grouped['@declaration.field-type'] === undefined) {
+      const target = tsAliasTarget(aliasAnchor.childForFieldName('value'));
+      if (target !== undefined) {
+        grouped['@declaration.field-type'] = syntheticCapture(
+          '@declaration.field-type',
+          target,
+          target.text,
         );
       }
     }
