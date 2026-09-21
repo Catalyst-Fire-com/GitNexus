@@ -34,6 +34,7 @@ import { decodeReceiverChain } from '../../utils/receiver-chain-codec.js';
 import type { DecorationStripper } from '../scope/walkers.js';
 import {
   findClassBindingInScope,
+  findShapeBindingInScope,
   resolveClassBindingForName,
   findEnclosingClassDef,
   findExportedDef,
@@ -399,7 +400,12 @@ function classOfDeclaredType(
     scopes,
     stripDecoration,
   );
-  return noteReceiverType(recordReceiverType, spelling, def);
+  // A receiver typed as an OBJECT-TYPE alias (`type Host = { records(): Families }`)
+  // has members and a class scope of its own (the query emits @scope.class for it)
+  // but is not class-like, so the class lookup declines it and the fold stopped
+  // at the first hop. Receiver typing only — inheritance never reaches here.
+  const shape = def ?? findShapeBindingInScope(typeRef.declaredAtScope, typeRef.rawName, scopes);
+  return noteReceiverType(recordReceiverType, spelling, shape);
 }
 
 /**

@@ -77,6 +77,15 @@ const CLASS_FIELD_FUNCTION_TYPES = new Set(['arrow_function', 'function_expressi
  * of the scope function nodes the scope query emits.
  */
 export function synthesizeTsReceiverBinding(fnNode: SyntaxNode): CaptureMatch | null {
+  // An explicit `this:` parameter is TypeScript's own declaration of what
+  // `this` is — `function fsIdOf(this: FsHost, id: string)` — and it wins over
+  // any enclosing type. Codebases that split a class into free functions
+  // invoked with `.call(host, ...)` type every body this way; without it,
+  // every `this.x()` in them resolves nothing.
+  const explicit = explicitThisType(fnNode);
+  if (explicit !== null)
+    return buildThisBinding(fnNode.childForFieldName('body') ?? fnNode, explicit);
+
   // Classify the function's role.
   const role = classifyFunctionRole(fnNode);
   if (role === null) return null;
@@ -209,4 +218,16 @@ function buildThisBinding(anchorNode: SyntaxNode, typeText: string): CaptureMatc
     '@type-binding.type': syntheticCapture('@type-binding.type', anchorNode, typeText),
   };
   return m;
+}
+
+/** The type named by a function's leading `this:` parameter, when it names one. */
+function explicitThisType(fnNode: SyntaxNode): string | null {
+  const params = fnNode.childForFieldName('parameters');
+  const first = params?.namedChildren.find((c) => c.type !== 'comment');
+  if (first === undefined || first.type !== 'required_parameter') return null;
+  const pattern = first.childForFieldName('pattern');
+  if (pattern === null || pattern.type !== 'this') return null;
+  const annotation = first.childForFieldName('type');
+  const named = annotation?.namedChildren[0];
+  return named !== undefined && named.type === 'type_identifier' ? named.text : null;
 }

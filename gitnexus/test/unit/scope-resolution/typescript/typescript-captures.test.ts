@@ -820,3 +820,15 @@ type Mapped = Record<string, View>;`),
     });
   });
 });
+
+describe('explicit this parameter', () => {
+  it('types `this` in a free function from its `this:` parameter', () => {
+    const thisTypes = emitTsScopeCaptures(
+      `type Host = { records(): string };\nexport function f(this: Host, id: string) { return this.records(); }\nfunction g(id: string) { return id; }`,
+      'host.ts',
+    )
+      .filter((m) => m['@type-binding.this'] !== undefined)
+      .map((m) => m['@type-binding.type']?.text);
+    expect(thisTypes).toEqual(['Host']);
+  });
+});

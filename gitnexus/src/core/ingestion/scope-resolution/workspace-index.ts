@@ -139,7 +139,12 @@ export function buildWorkspaceResolutionIndex(
 
     for (const scope of parsed.scopes) {
       if (scope.kind !== 'Class') continue;
-      const cd = scope.ownedDefs.find((d) => isClassLike(d.type));
+      // An OBJECT-TYPE alias (`type Host = { records(): Families }`) owns a Class
+      // scope for its members, but is not class-like, so nothing mapped it to that
+      // body and a receiver typed as it could not fold past its first member.
+      const cd =
+        scope.ownedDefs.find((d) => isClassLike(d.type)) ??
+        scope.ownedDefs.find((d) => d.type === 'TypeAlias');
       if (cd !== undefined) {
         classScopeIdByDefId.set(cd.nodeId, scope.id);
         classScopeIdToDefId.set(scope.id, cd.nodeId);
