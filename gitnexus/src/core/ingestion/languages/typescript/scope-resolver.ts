@@ -34,6 +34,7 @@ import {
   loadNuxtAutoImports,
   type NuxtAutoImportConfig,
 } from './nuxt-auto-imports.js';
+import { detectTypeScriptReceiverImplementations } from './receiver-implementations.js';
 
 /** Shape the orchestrator threads in via `RunScopeResolutionInput.resolutionConfig`. */
 interface TypescriptResolutionConfig {
@@ -116,6 +117,12 @@ const typescriptScopeResolver: ScopeResolver = {
     buildMro(graph, parsedFiles, nodeLookup, defaultLinearize),
 
   populateOwners: (parsed: ParsedFile) => populateClassOwnedMembers(parsed),
+
+  // An explicit class-instance `this as SomeObjectShape` assertion is
+  // conservative source evidence for this receiver-dispatch relation. The
+  // detector resolves the alias in the assertion's own lexical/import scope.
+  detectInterfaceImplementations: (parsedFiles, indexes) =>
+    detectTypeScriptReceiverImplementations(parsedFiles, indexes),
 
   // TypeScript uses `super` for super-class dispatch as a plain
   // identifier or as `super()` in constructors. Match both — `super`

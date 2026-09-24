@@ -22,7 +22,8 @@
  *   5. **Receiver-binding synthesis** (Unit 3) — `this` type anchors on
  *      instance methods, with arrow-function lexical-this walk-up.
  *
- * Pure given the input source text. No I/O, no globals consulted.
+ * The default path is pure given the input source text. A provider may observe
+ * the already-parsed root before capture synthesis without parsing it again.
  */
 
 import type { Capture, CaptureMatch } from 'gitnexus-shared';
@@ -383,6 +384,7 @@ export function emitTsScopeCaptures(
   sourceText: string,
   filePath: string,
   cachedTree?: unknown,
+  onParsedTree?: (root: SyntaxNode) => void,
 ): readonly CaptureMatch[] {
   // Reuse a pre-parsed Tree when the caller passes one via `cachedTree`; a
   // miss re-parses. (The cache is currently always empty — its only producer,
@@ -409,6 +411,8 @@ export function emitTsScopeCaptures(
   } else {
     recordCacheHit();
   }
+
+  onParsedTree?.(tree.rootNode);
 
   const rawMatches = getTsScopeQuery(filePath).matches(tree.rootNode);
   // Export evidence, read once per file (see `ts-js-export-marker.ts`).

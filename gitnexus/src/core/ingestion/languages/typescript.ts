@@ -10,6 +10,7 @@ import { SupportedLanguages } from 'gitnexus-shared';
 import type { CaptureMatch, NodeLabel } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
 import type { AstFrameworkPatternConfig } from '../language-provider.js';
+import { assertCloneable } from '../workers/clone-safety.js';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import {
   typescriptClassConfig,
@@ -128,6 +129,10 @@ import { extractDispatchGuardRoutes } from '../route-extractors/dispatch-guard.j
 import { extractDataRouteTableRoutes } from '../route-extractors/data-route-table.js';
 import { extractNestRoutes } from '../route-extractors/nest.js';
 import { extractConvexEndpointProperties } from './typescript/convex-endpoint-metadata.js';
+import {
+  captureTypeScriptReceiverAssertions,
+  collectTypeScriptReceiverImplementationSideChannel,
+} from './typescript/receiver-implementations.js';
 
 const extractJsTsRoutes = (...args: Parameters<typeof extractDispatchGuardRoutes>) => [
   ...extractDispatchGuardRoutes(...args),
@@ -450,7 +455,12 @@ export const typescriptProvider = defineLanguage({
   // ./typescript/index.ts for the full per-hook rationale and the
   // canonical capture vocabulary in ./typescript/query.ts
   // (TYPESCRIPT_SCOPE_QUERY constant).
-  emitScopeCaptures: emitTsScopeCaptures,
+  emitScopeCaptures: (sourceText, filePath, cachedTree) =>
+    emitTsScopeCaptures(sourceText, filePath, cachedTree, (root) =>
+      captureTypeScriptReceiverAssertions(filePath, root),
+    ),
+  collectCaptureSideChannel: (filePath) =>
+    assertCloneable(collectTypeScriptReceiverImplementationSideChannel(filePath)),
   // CFG/PDG substrate (#2081 M1) — runs in the worker on a --pdg run.
   cfgVisitor: createTypeScriptCfgVisitor(),
   interpretImport: interpretTsImport,
