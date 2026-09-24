@@ -34,11 +34,19 @@ function unwrapParentheses(node: SyntaxNode): SyntaxNode {
   return current;
 }
 
+function asExpressionOperand(node: SyntaxNode): SyntaxNode | null {
+  return node.childForFieldName('expression') ?? node.namedChild(0);
+}
+
+function asExpressionType(node: SyntaxNode): SyntaxNode | null {
+  return node.childForFieldName('type') ?? node.namedChild(1);
+}
+
 function isNestedAsExpression(node: SyntaxNode): boolean {
   let wrapped = node;
   while (wrapped.parent?.type === 'parenthesized_expression') wrapped = wrapped.parent;
   const parent = wrapped.parent;
-  return parent?.type === 'as_expression' && parent.childForFieldName('expression') === wrapped;
+  return parent?.type === 'as_expression' && asExpressionOperand(parent) === wrapped;
 }
 
 function normalizeNamedType(raw: string): string | undefined {
@@ -91,9 +99,9 @@ export function captureTypeScriptReceiverAssertions(filePath: string, root: Synt
       let expression = unwrapParentheses(node);
       let assertedType: SyntaxNode | null = null;
       while (expression.type === 'as_expression') {
-        const typeNode = expression.childForFieldName('type');
+        const typeNode = asExpressionType(expression);
         if (assertedType === null && typeNode !== null) assertedType = typeNode;
-        const inner = expression.childForFieldName('expression');
+        const inner = asExpressionOperand(expression);
         if (inner === null) break;
         expression = unwrapParentheses(inner);
       }
