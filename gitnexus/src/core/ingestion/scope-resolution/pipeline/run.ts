@@ -255,10 +255,25 @@ function emitDetectedInterfaceImplementations(
 ): readonly UndecidedSatisfaction[] {
   if (provider.detectInterfaceImplementations === undefined) return [];
 
+  const detected = provider.detectInterfaceImplementations(parsedFiles, indexes, model);
+  const detectedTargetDefIds = new Set(detected.implementations.keys());
+  const objectShapeTargetDefIds = new Set<string>();
+  for (const parsed of parsedFiles) {
+    for (const scope of parsed.scopes) {
+      if (scope.kind !== 'Class') continue;
+      for (const def of scope.ownedDefs) {
+        if (def.type === 'TypeAlias' && detectedTargetDefIds.has(def.nodeId)) {
+          objectShapeTargetDefIds.add(def.nodeId);
+        }
+      }
+    }
+  }
+
   const graphIdByDefId = new Map<string, string>();
   for (const parsed of parsedFiles) {
     for (const def of parsed.localDefs) {
-      if (def.type !== 'Class' && def.type !== 'Struct' && def.type !== 'Interface') continue;
+      const classLike = def.type === 'Class' || def.type === 'Struct' || def.type === 'Interface';
+      if (!classLike && !objectShapeTargetDefIds.has(def.nodeId)) continue;
       const graphId = resolveDefGraphId(parsed.filePath, def, nodeLookup);
       if (graphId !== undefined) graphIdByDefId.set(def.nodeId, graphId);
     }
@@ -269,7 +284,6 @@ function emitDetectedInterfaceImplementations(
     existing.add(`${rel.sourceId}->${rel.targetId}`);
   }
 
-  const detected = provider.detectInterfaceImplementations(parsedFiles, indexes, model);
   for (const [interfaceDefId, implementorDefIds] of detected.implementations) {
     const targetId = graphIdByDefId.get(interfaceDefId);
     if (targetId === undefined) continue;

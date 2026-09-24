@@ -538,6 +538,19 @@ export function emitReceiverBoundCalls(
   // DefIds, and `pickOverload` keys member lookup by those DefIds. Preserving
   // every part makes dispatch independent of declaration order.
   const graphIdToClassDefs = new Map<string, SymbolDefinition[]>();
+  // Object-type aliases own receiver members, but they are not class-like and
+  // must never enter MRO or EXTENDS traversal. They are included only as
+  // IMPLEMENTS targets for receiver-dispatch fan-out.
+  const objectShapeDefIds = new Set<string>();
+  for (const parsed of parsedFiles) {
+    for (const scope of parsed.scopes) {
+      if (scope.kind !== 'Class') continue;
+      for (const def of scope.ownedDefs) {
+        if (def.type === 'TypeAlias') objectShapeDefIds.add(def.nodeId);
+      }
+    }
+  }
+  const graphIdToReceiverTypeDefs = new Map<string, SymbolDefinition[]>();
   // The same correspondence read the other way, so the dispatch walk can name a
   // heritage EDGE (which is keyed by graph ids) from the two DEFS it holds.
   const classGraphIdByDefId = new Map<string, string>();
@@ -569,10 +582,29 @@ export function emitReceiverBoundCalls(
         graphIdToClassDefs.set(graphId, defs);
       }
       defs.push(def);
+      let receiverDefs = graphIdToReceiverTypeDefs.get(graphId);
+      if (receiverDefs === undefined) {
+        receiverDefs = [];
+        graphIdToReceiverTypeDefs.set(graphId, receiverDefs);
+      }
+      receiverDefs.push(def);
       classGraphIdByDefId.set(def.nodeId, graphId);
       if (def.typeParameters !== undefined && def.typeParameters.length > 0) {
         languageCapturesTypeParameters = true;
       }
+    }
+  }
+  for (const parsed of parsedFiles) {
+    for (const def of parsed.localDefs) {
+      if (!objectShapeDefIds.has(def.nodeId)) continue;
+      const graphId = resolveDefGraphId(parsed.filePath, def, nodeLookup);
+      if (graphId === undefined) continue;
+      let defs = graphIdToReceiverTypeDefs.get(graphId);
+      if (defs === undefined) {
+        defs = [];
+        graphIdToReceiverTypeDefs.set(graphId, defs);
+      }
+      defs.push(def);
     }
   }
   // Direct subtypes of a type, keyed by the SUPERtype's def id.
@@ -596,7 +628,9 @@ export function emitReceiverBoundCalls(
   };
   for (const relType of ['IMPLEMENTS', 'EXTENDS'] as const) {
     for (const rel of graph.iterRelationshipsByType(relType)) {
-      const superDefs = graphIdToClassDefs.get(rel.targetId);
+      const superDefs = (
+        relType === 'IMPLEMENTS' ? graphIdToReceiverTypeDefs : graphIdToClassDefs
+      ).get(rel.targetId);
       const subDefs = graphIdToClassDefs.get(rel.sourceId);
       if (superDefs === undefined || subDefs === undefined) continue;
       for (const superDef of superDefs) {
@@ -742,7 +776,7 @@ export function emitReceiverBoundCalls(
      *  receivers are concrete classes that return at the first line. */
     receiverTypeSpelling: string | undefined,
   ): number => {
-    if (ownerDef.type !== 'Interface') return 0;
+    if (ownerDef.type !== 'Interface' && !objectShapeDefIds.has(ownerDef.nodeId)) return 0;
     if (subtypesBySupertypeDefId.get(ownerDef.nodeId) === undefined) return 0;
     const receiverTypeArguments =
       receiverTypeSpelling === undefined
