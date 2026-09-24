@@ -48,6 +48,27 @@ async function getBackend(): Promise<LocalBackend> {
  * exit-code test below — pre-formatting it into a string would hide the very
  * fields that test reads.
  */
+/**
+ * Write every byte to fd 1. A single writeSync on a pipe accepts at most the pipe's buffer (64 KiB on
+ * macOS) and returns how much it took; ignoring that return cut every result over 64 KiB at exactly
+ * 65,536 bytes, mid-string, so the widest-reaching symbols returned invalid JSON (jarvis-knowledge,
+ * 2026-09-24: `impact applyDocumentEdits` on AncestralFire). Loop from the offset; when a non-blocking
+ * pipe is full (EAGAIN), wait a moment for the reader to drain it.
+ */
+function writeAll(text: string): void {
+  const buf = Buffer.from(text, 'utf8');
+  let offset = 0;
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  while (offset < buf.length) {
+    try {
+      offset += writeSync(1, buf, offset, buf.length - offset);
+    } catch (err: any) {
+      if (err?.code !== 'EAGAIN') throw err;
+      Atomics.wait(pause, 0, 0, 5);
+    }
+  }
+}
+
 function output<T>(data: T, render?: (data: T) => string): void {
   const text = render
     ? render(data)
@@ -55,7 +76,7 @@ function output<T>(data: T, render?: (data: T) => string): void {
       ? data
       : JSON.stringify(data, null, 2);
   try {
-    writeSync(1, text + '\n');
+    writeAll(text + '\n');
   } catch (err: any) {
     if (err?.code === 'EPIPE') {
       // Consumer closed the pipe (e.g., `gitnexus cypher ... | head -1`)
