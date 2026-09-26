@@ -37,6 +37,7 @@ import { EMBEDDABLE_LABELS, type CachedEmbedding } from '../embeddings/types.js'
 import {
   extensionManager,
   getFtsCapability,
+  probeFTSCapabilitiesOutOfProcess,
   resolveAnalyzeInstallPolicy,
   type ExtensionEnsureOptions,
 } from './extension-loader.js';
@@ -3365,7 +3366,10 @@ export const loadFTSExtension = async (
     throw new Error('LadybugDB not initialized. Call initLbug first.');
   }
 
-  const loaded = await extensionManager.ensure((sql) => queryAndDrain(c, sql), 'fts', 'FTS', opts);
+  const loaded = await extensionManager.ensure((sql) => queryAndDrain(c, sql), 'fts', 'FTS', {
+    ...opts,
+    capabilityProbe: opts.capabilityProbe ?? probeFTSCapabilitiesOutOfProcess,
+  });
   if (loaded && useModuleState) ftsLoaded = true;
   return loaded;
 };

@@ -1,4 +1,7 @@
 import { spawn } from 'child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LBUG_MAX_DB_SIZE } from './lbug-config.js';
 import { diagnoseExtensionLoad, type ExtensionLoadDiagnosis } from './extension-load-error.js';
@@ -39,10 +42,19 @@ export interface ExtensionCapability {
   diagnosis?: ExtensionLoadDiagnosis;
 }
 
+/** Result of validating an extension in a fresh process before loading it into
+ * the caller's connection. FTS can LOAD successfully while its native helper
+ * functions are from an older engine build, so LOAD alone is not sufficient. */
+export type ExtensionCapabilityProbeResult =
+  | { status: 'available' }
+  | { status: 'needs-install' | 'needs-update' | 'failed'; reason: string };
+
 /** Per-call overrides applied on top of `ExtensionManager` defaults. */
 export interface ExtensionEnsureOptions {
   policy?: ExtensionInstallPolicy;
   installTimeoutMs?: number;
+  /** Optional fresh-process capability check, run before the caller's connection LOADs. */
+  capabilityProbe?: () => Promise<ExtensionCapabilityProbeResult>;
   /**
    * Speculative probe: log an unavailable outcome at debug level instead of
    * warn, and do not consume the once-per-(extension, reason) warn budget.
@@ -140,8 +152,8 @@ export const installDuckDbExtensionOutOfProcess = async (
       env: {
         ...process.env,
         GITNEXUS_LBUG_EXTENSION_NAME: extensionName,
-        // The child picks INSTALL vs FORCE INSTALL from this LOAD error so it
-        // only re-downloads when the on-disk extension file is actually broken.
+        // The child picks INSTALL vs FORCE INSTALL from this error so it only
+        // re-downloads a broken file or a positively detected stale FTS build.
         ...(loadError ? { GITNEXUS_LBUG_EXTENSION_LOAD_ERROR: loadError } : {}),
       },
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -189,15 +201,89 @@ export const installDuckDbExtensionOutOfProcess = async (
   });
 };
 
+/** Probe FTS in a child process so a stale native library can fail or crash
+ * without poisoning the process that will serve GitNexus queries. */
+export const probeFTSCapabilitiesOutOfProcess = async (
+  timeoutMs: number = getExtensionInstallTimeoutMs(),
+): Promise<ExtensionCapabilityProbeResult> => {
+  const probeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-fts-probe-'));
+  return await new Promise<ExtensionCapabilityProbeResult>((resolve) => {
+    const child = spawn(
+      process.execPath,
+      [...getExtensionInstallChildProcessArgs('fts'), '--verify-fts-capability'],
+      {
+        env: {
+          ...process.env,
+          GITNEXUS_LBUG_EXTENSION_NAME: 'fts',
+          GITNEXUS_FTS_PROBE_DIR: probeDir,
+        },
+        stdio: ['ignore', 'ignore', 'pipe'],
+        windowsHide: true,
+      },
+    );
+
+    let stderr = '';
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (chunk) => {
+      stderr = (stderr + chunk).slice(-4000);
+    });
+
+    let settled = false;
+    let timedOut = false;
+    const finish = async (result: ExtensionCapabilityProbeResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      await fs.rm(probeDir, { recursive: true, force: true }).catch(() => {});
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
+
+    child.on('error', (err) => {
+      finish({ status: 'failed', reason: `could not start FTS capability probe: ${err.message}` });
+    });
+
+    child.on('exit', (code, signal) => {
+      if (timedOut) {
+        void finish({
+          status: 'failed',
+          reason: `FTS capability probe timed out after ${timeoutMs}ms`,
+        });
+        return;
+      }
+      if (code === 0) {
+        void finish({ status: 'available' });
+        return;
+      }
+      const reason =
+        `FTS capability probe exited with ${signal ?? `exit code ${code}`}` +
+        (stderr ? `: ${oneLine(stderr)}` : '');
+      if (/has not been installed|not been installed/i.test(stderr)) {
+        void finish({ status: 'needs-install', reason });
+      } else if (
+        /function _(?:CREATE|QUERY)_FTS_INDEX does not exist/i.test(stderr) ||
+        signal === 'SIGSEGV' ||
+        signal === 'SIGABRT'
+      ) {
+        void finish({ status: 'needs-update', reason });
+      } else {
+        void finish({ status: 'failed', reason });
+      }
+    });
+  });
+};
+
 /**
  * Centralized lifecycle manager for optional LadybugDB extensions.
  *
- * Always tries `LOAD EXTENSION <name>` first — it is per-connection,
- * idempotent, and never touches the network. If `LOAD` fails and the active
- * policy permits, the manager runs a single bounded out-of-process `INSTALL`
- * attempt per process and retries `LOAD`. Capability outcomes are cached so
- * unavailable extensions degrade search features without ever blocking
- * subsequent analyze or query calls.
+ * When a caller supplies a capability probe, validate in a fresh process before
+ * loading the extension into its connection. Then try `LOAD EXTENSION <name>`;
+ * if `LOAD` fails and the active policy permits, run one bounded out-of-process
+ * `INSTALL` attempt and retry. Capability outcomes are cached so unavailable
+ * extensions degrade search features without blocking later calls.
  *
  * Policy precedence (most specific wins):
  *   per-call `opts.policy` → constructor `options.policy` → env → `load-only`
@@ -205,6 +291,12 @@ export const installDuckDbExtensionOutOfProcess = async (
 export class ExtensionManager {
   private readonly capabilities = new Map<string, ExtensionCapability>();
   private readonly installAttempted = new Map<string, ExtensionInstallResult>();
+  private readonly installInFlight = new Map<string, Promise<ExtensionInstallResult>>();
+  private readonly capabilityProbes = new Map<string, ExtensionCapabilityProbeResult>();
+  private readonly capabilityProbeInFlight = new Map<
+    string,
+    Promise<ExtensionCapabilityProbeResult>
+  >();
   private readonly warnedKeys = new Set<string>();
 
   constructor(private readonly options: ExtensionManagerOptions = {}) {}
@@ -213,6 +305,9 @@ export class ExtensionManager {
   reset(): void {
     this.capabilities.clear();
     this.installAttempted.clear();
+    this.installInFlight.clear();
+    this.capabilityProbes.clear();
+    this.capabilityProbeInFlight.clear();
     this.warnedKeys.clear();
   }
 
@@ -249,6 +344,107 @@ export class ExtensionManager {
       return false;
     }
 
+    const installExtension = async (loadError?: string): Promise<ExtensionInstallResult> => {
+      const existing = this.installAttempted.get(name);
+      if (existing) return existing;
+      const inFlight = this.installInFlight.get(name);
+      if (inFlight) return await inFlight;
+      const installFn = this.options.installExtension ?? installDuckDbExtensionOutOfProcess;
+      const pending = installFn(name, timeoutMs, loadError).then((result) => {
+        this.installAttempted.set(name, result);
+        return result;
+      });
+      this.installInFlight.set(name, pending);
+      try {
+        return await pending;
+      } finally {
+        if (this.installInFlight.get(name) === pending) this.installInFlight.delete(name);
+      }
+    };
+
+    const capabilityProbeFn = opts.capabilityProbe;
+    const probeCapability = async (refresh = false): Promise<ExtensionCapabilityProbeResult> => {
+      if (refresh) this.capabilityProbes.delete(name);
+      const cached = this.capabilityProbes.get(name);
+      if (cached) return cached;
+      const inFlight = this.capabilityProbeInFlight.get(name);
+      if (inFlight) return await inFlight;
+      const pending = (async (): Promise<ExtensionCapabilityProbeResult> => {
+        try {
+          if (!capabilityProbeFn) {
+            return { status: 'failed', reason: 'FTS capability probe was not configured' };
+          }
+          return await capabilityProbeFn();
+        } catch (err) {
+          return {
+            status: 'failed',
+            reason: oneLine(err instanceof Error ? err.message : String(err)),
+          };
+        }
+      })();
+      this.capabilityProbeInFlight.set(name, pending);
+      try {
+        const result = await pending;
+        this.capabilityProbes.set(name, result);
+        return result;
+      } finally {
+        if (this.capabilityProbeInFlight.get(name) === pending) {
+          this.capabilityProbeInFlight.delete(name);
+        }
+      }
+    };
+
+    if (capabilityProbeFn) {
+      let probe = await probeCapability();
+
+      if (probe.status !== 'available') {
+        if (probe.status === 'failed' || policy === 'load-only') {
+          this.markUnavailable(
+            name,
+            label,
+            `fresh-process capability probe failed: ${probe.reason}`,
+            warn,
+            quiet,
+          );
+          return false;
+        }
+
+        const staleBuildDetected = probe.status === 'needs-update';
+        const staleBuildReason = probe.reason;
+        const install = await installExtension(
+          probe.status === 'needs-update' ? probe.reason : undefined,
+        );
+        if (!install.success) {
+          this.markUnavailable(
+            name,
+            label,
+            `${install.message}; fresh-process capability probe failed: ${probe.reason}`,
+            warn,
+            quiet,
+          );
+          return false;
+        }
+
+        probe = await probeCapability(true);
+        if (probe.status !== 'available') {
+          this.markUnavailable(
+            name,
+            label,
+            `${install.message}; capability probe still failed after install: ${probe.reason}`,
+            warn,
+            quiet,
+          );
+          return false;
+        }
+        if (staleBuildDetected) {
+          logger.warn(
+            `GitNexus: ${label} extension was refreshed after a stale capability probe: ` +
+              oneLine(staleBuildReason).slice(0, 240),
+          );
+        }
+      }
+    }
+
     const loadError = await this.tryLoad(query, name);
     if (loadError === null) {
       this.markLoaded(name);
@@ -266,14 +462,9 @@ export class ExtensionManager {
       return false;
     }
 
-    let install = this.installAttempted.get(name);
-    if (!install) {
-      const installFn = this.options.installExtension ?? installDuckDbExtensionOutOfProcess;
-      // Hand the child the LOAD error so it re-downloads (FORCE) only when the
-      // present extension file is provably broken, not on every LOAD failure.
-      install = await installFn(name, timeoutMs, loadError);
-      this.installAttempted.set(name, install);
-    }
+    // Hand the child the LOAD error so it re-downloads (FORCE) only for a
+    // broken file or a positively detected stale FTS build.
+    const install = await installExtension(loadError);
 
     if (!install.success) {
       this.markUnavailable(
