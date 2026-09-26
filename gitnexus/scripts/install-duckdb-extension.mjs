@@ -7,12 +7,10 @@ import { pathToFileURL } from 'node:url';
 
 const EXTENSION_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
 
-// Positive on-disk-corruption signatures. `FORCE INSTALL` re-downloads even when
-// a file is already present; we only want that when the LOAD error proves the
-// existing file is bad (truncated/wrong-platform, #2374). For everything else —
-// a missing file (plain INSTALL downloads it), or a permanent non-file failure a
-// re-download can never fix (missing runtime dep: "cannot open shared object") —
-// plain INSTALL avoids re-downloading ~2 MB on every analyze run forever.
+// `FORCE INSTALL` re-downloads an existing file. Use it only for proven file
+// corruption or a stale FTS build whose public wrapper calls a missing native
+// helper. A missing file uses plain INSTALL; unrelated LOAD failures do not
+// repeatedly download the same extension.
 // Exported so a parity test keeps this byte-identical to the copy in
 // src/core/lbug/extension-load-error.ts (this `.mjs` cannot import that `.ts`), #2383 F5b.
 export const FILE_CORRUPTION_SIGNATURES = [
@@ -25,14 +23,24 @@ export const FILE_CORRUPTION_SIGNATURES = [
   /truncat/i,
 ];
 
+const STALE_FTS_SIGNATURES = [
+  /function _CREATE_FTS_INDEX does not exist/i,
+  /function _QUERY_FTS_INDEX does not exist/i,
+  /FTS capability probe exited with SIG(?:SEGV|ABRT)/i,
+];
+
 /**
  * Decide the install verb from the LOAD error that triggered this install.
- * `FORCE INSTALL` only when the error positively indicates file-level breakage;
+ * `FORCE INSTALL` only for file corruption or a known stale FTS capability;
  * otherwise plain `INSTALL` (missing file, missing-dependency dlopen failure,
  * or unknown/absent error).
  */
 export function chooseInstallVerb(loadError) {
-  if (loadError && FILE_CORRUPTION_SIGNATURES.some((re) => re.test(loadError))) {
+  if (
+    loadError &&
+    (FILE_CORRUPTION_SIGNATURES.some((re) => re.test(loadError)) ||
+      STALE_FTS_SIGNATURES.some((re) => re.test(loadError)))
+  ) {
     return 'FORCE INSTALL';
   }
   return 'INSTALL';
@@ -55,13 +63,14 @@ function resolveMaxDbSize() {
 }
 
 /** Open a scratch LadybugDB and return its connection plus a disposer. */
-async function defaultConnect(lbugMaxDbSize) {
+async function defaultConnect(lbugMaxDbSize, probeDir) {
   const require = createRequire(import.meta.url);
   const lbugModule = require('@ladybugdb/core');
   const lbug = lbugModule.default ?? lbugModule;
 
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-ext-install-'));
-  const dbPath = path.join(tmpDir, 'install.lbug');
+  const ownsTmpDir = !probeDir;
+  const tmpDir = probeDir ?? (await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-ext-install-')));
+  const dbPath = path.join(tmpDir, probeDir ? 'fts-capability-probe.lbug' : 'install.lbug');
   const db = new lbug.Database(dbPath, 0, false, false, lbugMaxDbSize);
   const conn = new lbug.Connection(db);
   return {
@@ -69,9 +78,54 @@ async function defaultConnect(lbugMaxDbSize) {
     dispose: async () => {
       await conn.close().catch(() => {});
       await db.close().catch(() => {});
-      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      if (ownsTmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     },
   };
+}
+
+async function verifyFtsCapabilities(conn) {
+  const table = 'GitNexusFtsCapabilityProbe';
+  const index = 'gitnexus_fts_capability_probe';
+  const functionsResult = await conn.query('CALL SHOW_FUNCTIONS() RETURN *');
+  let functions;
+  try {
+    functions = await functionsResult.getAll();
+  } finally {
+    try {
+      await functionsResult.close();
+    } catch {
+      // The scratch database is disposed below; a close failure does not mask
+      // the capability result.
+    }
+  }
+  const names = new Set(functions.map((row) => String(row.name ?? '').toUpperCase()));
+  for (const name of ['CREATE_FTS_INDEX', 'QUERY_FTS_INDEX']) {
+    if (!names.has(name)) throw new Error(`FTS capability probe: ${name} is not registered`);
+  }
+
+  // This is a real, on-disk LadybugDB database created by defaultConnect and
+  // removed by its disposer. The throwaway table/index catches stale extension
+  // builds whose public CREATE_FTS_INDEX wrapper exists but calls a missing
+  // native helper such as _CREATE_FTS_INDEX.
+  await conn.query(`CREATE NODE TABLE ${table}(name STRING, PRIMARY KEY(name))`);
+  await conn.query('CREATE (:' + table + " {name: 'jkftsprobe'})");
+  await conn.query(`CALL CREATE_FTS_INDEX('${table}', '${index}', ['name'])`);
+  const queryResult = await conn.query(
+    "CALL QUERY_FTS_INDEX('" + table + "', '" + index + "', 'jkftsprobe') RETURN node.name, score",
+  );
+  try {
+    const rows = await queryResult.getAll();
+    if (!rows.some((row) => String(row['node.name'] ?? '') === 'jkftsprobe')) {
+      throw new Error('FTS capability probe created the index but could not query its row');
+    }
+  } finally {
+    try {
+      await queryResult.close();
+    } catch {
+      // The scratch database is disposed below; a close failure does not mask
+      // the capability result.
+    }
+  }
 }
 
 /**
@@ -80,29 +134,44 @@ async function defaultConnect(lbugMaxDbSize) {
  * @param {string} extensionName
  * @param {object} [options]
  * @param {boolean} [options.verifyOnly] LOAD-only Docker build gate — no install.
+ * @param {boolean} [options.verifyFtsCapability] Probe FTS functions on a real scratch DB.
  * @param {string} [options.loadError] The parent's LOAD failure; selects the verb.
  * @param {(size: number) => Promise<{conn: {query: (sql: string) => Promise<unknown>}, dispose: () => Promise<void>}>} [options.connect]
  *        Connection factory; injectable for offline unit tests.
  */
 export async function installDuckDbExtension(extensionName, options = {}) {
-  const { verifyOnly = false, loadError, connect } = options;
+  const { verifyOnly = false, verifyFtsCapability = false, loadError, connect } = options;
   if (!extensionName || !EXTENSION_NAME_PATTERN.test(extensionName)) {
     throw new Error(`Invalid DuckDB extension name: ${extensionName ?? '<missing>'}`);
   }
 
-  const makeConnection = connect ?? (() => defaultConnect(resolveMaxDbSize()));
+  const makeConnection =
+    connect ??
+    (() =>
+      defaultConnect(
+        resolveMaxDbSize(),
+        verifyFtsCapability ? process.env.GITNEXUS_FTS_PROBE_DIR : undefined,
+      ));
   const { conn, dispose } = await makeConnection();
 
   try {
-    if (verifyOnly) {
+    if (verifyOnly || verifyFtsCapability) {
       // Prove a previously-baked extension is resolvable by a FRESH process
       // under the current HOME (the runtime `LOAD EXTENSION` path) — no INSTALL,
       // no network. Used as a Docker build-time gate so a HOME/extension-dir
       // mismatch fails the build instead of silently degrading search at runtime.
       await conn.query(`LOAD EXTENSION ${extensionName}`);
-      console.log(
-        `[install-ext] LOAD-only verify OK for '${extensionName}' (HOME=${process.env.HOME})`,
-      );
+      if (verifyFtsCapability) {
+        if (extensionName.toLowerCase() !== 'fts') {
+          throw new Error('--verify-fts-capability is only valid for the fts extension');
+        }
+        await verifyFtsCapabilities(conn);
+        console.log(`[install-ext] FTS capability verify OK (HOME=${process.env.HOME})`);
+      } else {
+        console.log(
+          `[install-ext] LOAD-only verify OK for '${extensionName}' (HOME=${process.env.HOME})`,
+        );
+      }
     } else {
       // Plain INSTALL is a no-op when the file already exists; escalate to FORCE
       // only when the LOAD error proves the on-disk file is broken (#2374).
@@ -117,6 +186,7 @@ export async function installDuckDbExtension(extensionName, options = {}) {
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   installDuckDbExtension(process.argv[2] ?? process.env.GITNEXUS_LBUG_EXTENSION_NAME, {
     verifyOnly: process.argv.includes('--verify-only'),
+    verifyFtsCapability: process.argv.includes('--verify-fts-capability'),
     loadError: process.env.GITNEXUS_LBUG_EXTENSION_LOAD_ERROR,
   }).catch((err) => {
     console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
